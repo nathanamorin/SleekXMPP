@@ -114,15 +114,14 @@ class XMLStream(object):
     :param int port: The port to use for the connection. Defaults to 0.
     """
 
-    def __init__(self, socket=None, host='', port=0, certfile=None,
-                 keyfile=None, ca_certs=None, **kwargs):
+    def __init__(self, socket=None, host='', port=0):
         #: Most XMPP servers support TLSv1, but OpenFire in particular
         #: does not work well with it. For OpenFire, set
         #: :attr:`ssl_version` to use ``SSLv23``::
         #:
         #:     import ssl
         #:     xmpp.ssl_version = ssl.PROTOCOL_SSLv23
-        self.ssl_version = ssl.PROTOCOL_TLSv1
+        self.ssl_version = ssl.PROTOCOL_TLSv1_2
 
         #: The list of accepted ciphers, in OpenSSL Format.
         #: It might be useful to override it for improved security
@@ -137,16 +136,16 @@ class XMLStream(object):
         #:
         #:     On Mac OS X, certificates in the system keyring will
         #:     be consulted, even if they are not in the provided file.
-        self.ca_certs = ca_certs
+        self.ca_certs = None
 
         #: Path to a file containing a client certificate to use for
         #: authenticating via SASL EXTERNAL. If set, there must also
         #: be a corresponding `:attr:keyfile` value.
-        self.certfile = certfile
+        self.certfile = None
 
         #: Path to a file containing the private key for the selected
         #: client certificate to use for authenticating via SASL EXTERNAL.
-        self.keyfile = keyfile
+        self.keyfile = None
 
         self._der_cert = None
 
@@ -292,7 +291,7 @@ class XMLStream(object):
         self.event_queue = Queue()
 
         #: A queue of string data to be sent over the stream.
-        self.send_queue = Queue(maxsize=256)
+        self.send_queue = Queue()
         self.send_queue_lock = threading.Lock()
         self.send_lock = threading.RLock()
 
@@ -461,11 +460,9 @@ class XMLStream(object):
     def _connect(self, reattempt=True):
         self.scheduler.remove('Session timeout check')
 
-        if self.reconnect_delay is None:
+        if self.reconnect_delay is None or not reattempt:
             delay = 1.0
-            self.reconnect_delay = delay
-
-        if reattempt:
+        else:
             delay = min(self.reconnect_delay * 2, self.reconnect_max_delay)
             delay = random.normalvariate(delay, delay * 0.1)
             log.debug('Waiting %s seconds before connecting.', delay)
@@ -526,8 +523,7 @@ class XMLStream(object):
                 'keyfile': self.keyfile,
                 'ca_certs': self.ca_certs,
                 'cert_reqs': cert_policy,
-                'do_handshake_on_connect': False,
-                "ssl_version": self.ssl_version
+                'do_handshake_on_connect': False
             })
 
             if sys.version_info >= (2, 7):
@@ -839,10 +835,8 @@ class XMLStream(object):
         to be restarted.
         """
         log.info("Negotiating TLS")
-        log.info(
-            "Using SSL version: %s",
-            ssl.get_protocol_name(self.ssl_version).replace('PROTOCOL_', '', 1)
-        )
+        ssl_versions = {5: 'TLS 1.2', 1: 'SSL 3', 2: 'SSL 2/3'}
+        log.info("Using SSL version: %s", ssl_versions[self.ssl_version])
         if self.ca_certs is None:
             cert_policy = ssl.CERT_NONE
         else:
@@ -853,14 +847,13 @@ class XMLStream(object):
             'keyfile': self.keyfile,
             'ca_certs': self.ca_certs,
             'cert_reqs': cert_policy,
-            'do_handshake_on_connect': False,
-            "ssl_version": self.ssl_version
+            'do_handshake_on_connect': False
         })
 
         if sys.version_info >= (2, 7):
             ssl_args['ciphers'] = self.ciphers
 
-        ssl_socket = ssl.wrap_socket(self.socket, **ssl_args)
+        ssl_socket = ssl.wrap_socket(self.socket, **ssl_args);
 
         if hasattr(self.socket, 'socket'):
             # We are using a testing socket, so preserve the top
@@ -945,13 +938,12 @@ class XMLStream(object):
 
             self.whitespace_keepalive_interval = 300
         """
-        if self.whitespace_keepalive:
-            self.schedule('Whitespace Keepalive',
-                          self.whitespace_keepalive_interval,
-                          self.send_raw,
-                          args=(' ',),
-                          kwargs={'now': True},
-                          repeat=True)
+        self.schedule('Whitespace Keepalive',
+                      self.whitespace_keepalive_interval,
+                      self.send_raw,
+                      args=(' ',),
+                      kwargs={'now': True},
+                      repeat=True)
 
     def _remove_schedules(self, event):
         """Remove whitespace keepalive and certificate expiration schedules."""
@@ -1156,7 +1148,7 @@ class XMLStream(object):
         """
         return len(self.__event_handlers.get(name, []))
 
-    def event(self, name, data=None, direct=False):
+    def event(self, name, data={}, direct=False):
         """Manually trigger a custom event.
 
         :param name: The name of the event to trigger.
@@ -1167,9 +1159,6 @@ class XMLStream(object):
                        event queue. All event handlers will run in the
                        same thread.
         """
-        if not data:
-            data = {}
-
         log.debug("Event triggered: " + name)
 
         handlers = self.__event_handlers.get(name, [])
@@ -1329,6 +1318,9 @@ class XMLStream(object):
                         try:
                             sent += self.socket.send(data[sent:])
                             count += 1
+                        except Socket.error as serr:
+                            if serr.errno != errno.EINTR:
+                                raise
                         except ssl.SSLError as serr:
                             if tries >= self.ssl_retry_max:
                                 log.debug('SSL error: max retries reached')
@@ -1343,9 +1335,6 @@ class XMLStream(object):
                             if not self.stop.is_set():
                                 time.sleep(self.ssl_retry_delay)
                             tries += 1
-                        except Socket.error as serr:
-                            if serr.errno != errno.EINTR:
-                                raise
                 if count > 1:
                     log.debug('SENT: %d chunks', count)
             except (Socket.error, ssl.SSLError) as serr:
@@ -1755,6 +1744,9 @@ class XMLStream(object):
                             try:
                                 sent += self.socket.send(enc_data[sent:])
                                 count += 1
+                            except Socket.error as serr:
+                                if serr.errno != errno.EINTR:
+                                    raise
                             except ssl.SSLError as serr:
                                 if tries >= self.ssl_retry_max:
                                     log.debug('SSL error: max retries reached')
@@ -1767,9 +1759,6 @@ class XMLStream(object):
                                 if not self.stop.is_set():
                                     time.sleep(self.ssl_retry_delay)
                                 tries += 1
-                            except Socket.error as serr:
-                                if serr.errno != errno.EINTR:
-                                    raise
                     if count > 1:
                         log.debug('SENT: %d chunks', count)
                     self.send_queue.task_done()
